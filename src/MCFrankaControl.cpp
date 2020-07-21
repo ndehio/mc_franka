@@ -33,86 +33,86 @@ template<ControlMode cm>
 struct PandaControlLoop
 {
   PandaControlLoop(const std::string & name, const std::string & ip, size_t steps)
-  : name(name), robot(ip), state(robot.readOnce()), control(state), steps(steps)
+  : name(name), robotFE(ip), stateFE(robotFE.readOnce()), controlFE(stateFE), steps(steps)
   {
   }
 
-  void updateSensors(mc_rbdyn::Robot & robot, mc_rbdyn::Robot & real)
+  void updateSensors(mc_rbdyn::Robot & robotMC, mc_rbdyn::Robot & realMC)
   {
     using get_sensor_t = const std::vector<double> & (mc_rbdyn::Robot::*)() const;
     using set_sensor_t = void (mc_rbdyn::Robot::*)(const std::vector<double> &);
     auto updateSensor = [&](get_sensor_t get, set_sensor_t set, const std::array<double, 7> & value) {
-      auto sensor = (robot.*get)();
-      if(sensor.size() != robot.refJointOrder().size())
+      auto sensor = (robotMC.*get)();
+      if(sensor.size() != robotMC.refJointOrder().size())
       {
-        sensor.resize(robot.refJointOrder().size());
+        sensor.resize(robotMC.refJointOrder().size());
       }
       for(size_t i = 0; i < value.size(); ++i)
       {
         sensor[i] = value[i];
       }
-      (robot.*set)(sensor);
-      (real.*set)(sensor);
+      (robotMC.*set)(sensor);
+      (realMC.*set)(sensor);
     };
-    updateSensor(&mc_rbdyn::Robot::encoderValues, &mc_rbdyn::Robot::encoderValues, state.q);
-    updateSensor(&mc_rbdyn::Robot::encoderVelocities, &mc_rbdyn::Robot::encoderVelocities, state.dq);
-    updateSensor(&mc_rbdyn::Robot::jointTorques, &mc_rbdyn::Robot::jointTorques, state.tau_J);
-    command = robot.mbc();
+    updateSensor(&mc_rbdyn::Robot::encoderValues, &mc_rbdyn::Robot::encoderValues, stateFE.q);
+    updateSensor(&mc_rbdyn::Robot::encoderVelocities, &mc_rbdyn::Robot::encoderVelocities, stateFE.dq);
+    updateSensor(&mc_rbdyn::Robot::jointTorques, &mc_rbdyn::Robot::jointTorques, stateFE.tau_J);
+    commandMC = robotMC.mbc();
   }
 
-  void updateSensors(mc_control::MCGlobalController & controller)
+  void updateSensors(mc_control::MCGlobalController & controllerMC)
   {
-    auto & robot = controller.controller().robots().robot(name);
-    auto & real = controller.controller().realRobots().robot(name);
-    updateSensors(robot, real);
+    auto & robotMC = controllerMC.controller().robots().robot(name);
+    auto & realMC = controllerMC.controller().realRobots().robot(name);
+    updateSensors(robotMC, realMC);
   }
 
-  void init(mc_control::MCGlobalController & controller)
+  void init(mc_control::MCGlobalController & controllerMC)
   {
-    auto & robot = controller.controller().robots().robot(name);
-    auto & real = controller.controller().realRobots().robot(name);
-    updateSensors(robot, real);
-    const auto & rjo = robot.refJointOrder();
+    auto & robotMC = controllerMC.controller().robots().robot(name);
+    auto & realMC = controllerMC.controller().realRobots().robot(name);
+    updateSensors(robotMC, realMC);
+    const auto & rjo = robotMC.refJointOrder();
     for(size_t i = 0; i < rjo.size(); ++i)
     {
-      auto jIndex = robot.jointIndexByName(rjo[i]);
-      robot.mbc().q[jIndex][0] = state.q[i];
-      robot.mbc().jointTorque[jIndex][0] = state.tau_J[i];
+      auto jIndex = robotMC.jointIndexByName(rjo[i]);
+      robotMC.mbc().q[jIndex][0] = stateFE.q[i];
+      robotMC.mbc().jointTorque[jIndex][0] = stateFE.tau_J[i];
     }
-    robot.forwardKinematics();
-    real.mbc() = robot.mbc();
+    robotMC.forwardKinematics();
+    realMC.mbc() = robotMC.mbc();
   }
 
-  void control_thread(mc_control::MCGlobalController & controller)
+  void control_thread(mc_control::MCGlobalController & controllerMC)
   {
-    control.control(robot,
-                    [ this, &controller ](const franka::RobotState & stateIn, franka::Duration) ->
+    controlFE.control(robotFE,
+                    [ this, &controllerMC ](const franka::RobotState & stateIn, franka::Duration) ->
                     typename PandaControlType<cm>::ReturnT {
-                      this->state = stateIn;
+                      this->stateFE = stateIn;
                       sensor_id += 1;
-                      auto & robot = controller.controller().robots().robot(name);
-                      auto & real = controller.controller().realRobots().robot(name);
+                      auto & robotMC = controllerMC.controller().robots().robot(name);
+                      //auto & realMC = controllerMC.controller().realRobots().robot(name); //TODO not required?
                       if(sensor_id % steps == 0)
                       {
                         sensors_cv.notify_all();
                         std::unique_lock<std::mutex> command_lock(command_mutex);
                         command_cv.wait(command_lock);
                       }
-                      if(controller.running)
+                      if(controllerMC.running)
                       {
-                        return control.update(robot, command, sensor_id % steps, steps);
+                        return controlFE.update(robotMC, commandMC, sensor_id % steps, steps);
                       }
-                      return franka::MotionFinished(control);
+                      return franka::MotionFinished(controlFE);
                     });
   }
 
   std::string name;
-  franka::Robot robot;
-  franka::RobotState state;
-  PandaControlType<cm> control;
+  franka::Robot robotFE;
+  franka::RobotState stateFE;
+  PandaControlType<cm> controlFE;
   size_t sensor_id = 0;
   size_t steps = 1;
-  rbd::MultiBodyConfig command;
+  rbd::MultiBodyConfig commandMC;
 };
 
 template<ControlMode cm>
@@ -120,61 +120,61 @@ void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig
 {
   auto frankaConfig = gconfig.config("Franka");
   auto ignoredRobots = frankaConfig("ignored", std::vector<std::string>{});
-  mc_control::MCGlobalController controller(gconfig);
-  if(controller.controller().timeStep < 0.001)
+  mc_control::MCGlobalController controllerMC(gconfig);
+  if(controllerMC.controller().timeStep < 0.001)
   {
     mc_rtc::log::error_and_throw<std::runtime_error>("mc_rtc cannot run faster than 1kHz with mc_franka");
   }
-  size_t n_steps = std::ceil(controller.controller().timeStep / 0.001);
-  size_t freq = std::ceil(1 / controller.controller().timeStep);
+  size_t n_steps = std::ceil(controllerMC.controller().timeStep / 0.001);
+  size_t freq = std::ceil(1 / controllerMC.controller().timeStep);
   mc_rtc::log::info("mc_rtc running at {}Hz, will interpolate every {} panda control step", freq, n_steps);
-  auto & robots = controller.controller().robots();
+  auto & robotsMC = controllerMC.controller().robots();
   // Initialize all real robots
-  for(size_t i = controller.realRobots().size(); i < robots.size(); ++i)
+  for(size_t i = controllerMC.realRobots().size(); i < robotsMC.size(); ++i)
   {
-    controller.realRobots().robotCopy(robots.robot(i));
-    controller.realRobots().robots().back().name(robots.robot(i).name());
+    controllerMC.realRobots().robotCopy(robotsMC.robot(i));
+    controllerMC.realRobots().robots().back().name(robotsMC.robot(i).name());
   }
   // Initialize controlled panda robot
   std::vector<std::pair<PandaControlLoop<cm>, size_t>> pandas;
-  for(auto & robot : robots)
+  for(auto & robotMC : robotsMC)
   {
-    if(robot.mb().nrDof() == 0)
+    if(robotMC.mb().nrDof() == 0)
     {
       continue;
     }
-    if(std::find(ignoredRobots.begin(), ignoredRobots.end(), robot.name()) != ignoredRobots.end())
+    if(std::find(ignoredRobots.begin(), ignoredRobots.end(), robotMC.name()) != ignoredRobots.end())
     {
       continue;
     }
-    if(frankaConfig.has(robot.name()))
+    if(frankaConfig.has(robotMC.name()))
     {
-      std::string ip = frankaConfig(robot.name())("ip");
-      pandas.emplace_back(std::make_pair<PandaControlLoop<cm>, size_t>({robot.name(), ip, n_steps}, 0));
-      pandas.back().first.init(controller);
+      std::string ip = frankaConfig(robotMC.name())("ip");
+      pandas.emplace_back(std::make_pair<PandaControlLoop<cm>, size_t>({robotMC.name(), ip, n_steps}, 0));
+      pandas.back().first.init(controllerMC);
     }
     else
     {
-      mc_rtc::log::warning("The loaded controller uses an actuated robot that is not configured and not ignored: {}",
-                           robot.name());
+      mc_rtc::log::warning("The loaded controllerMC uses an actuated robot that is not configured and not ignored: {}",
+                           robotMC.name());
     }
   }
   for(auto & panda : pandas)
   {
-    controller.controller().logger().addLogEntry(panda.first.name + "_sensors_id", [&panda]() { return panda.second; });
+    controllerMC.controller().logger().addLogEntry(panda.first.name + "_sensors_id", [&panda]() { return panda.second; });
   }
-  controller.init(robots.robot().encoderValues());
-  controller.running = true;
-  controller.controller().gui()->addElement(
-      {"Franka"}, mc_rtc::gui::Button("Stop controller", [&controller]() { controller.running = false; }));
+  controllerMC.init(robotsMC.robot().encoderValues());
+  controllerMC.running = true;
+  controllerMC.controller().gui()->addElement(
+      {"Franka"}, mc_rtc::gui::Button("Stop controllerMC", [&controllerMC]() { controllerMC.running = false; }));
   // Start panda control loops
   std::vector<std::thread> panda_threads;
   for(auto & panda : pandas)
   {
-    panda_threads.emplace_back([&panda, &controller]() { panda.first.control_thread(controller); });
+    panda_threads.emplace_back([&panda, &controllerMC]() { panda.first.control_thread(controllerMC); });
   }
   size_t iter = 0;
-  while(controller.running)
+  while(controllerMC.running)
   {
     {
       std::unique_lock<std::mutex> sensors_lock(sensors_mutex);
@@ -202,12 +202,12 @@ void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig
       }
       for(auto & panda : pandas)
       {
-        panda.first.updateSensors(controller);
+        panda.first.updateSensors(controllerMC);
         panda.second = panda.first.sensor_id;
       }
       command_cv.notify_all();
     }
-    controller.run();
+    controllerMC.run();
   }
   for(auto & th : panda_threads)
   {
@@ -215,12 +215,13 @@ void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig
   }
 }
 
-template<ControlMode cm>
-struct GlobalControlLoop
-{
-  mc_control::MCGlobalController & controller;
-  std::vector<PandaControlLoop<cm>> robots;
-};
+//TODO is this struct required?
+// template<ControlMode cm>
+// struct GlobalControlLoop
+// {
+//   mc_control::MCGlobalController & controllerMC;
+//   std::vector<PandaControlLoop<cm>> robotsFE;
+// };
 
 int main(int argc, char * argv[])
 {
