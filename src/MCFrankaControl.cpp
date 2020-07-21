@@ -1,334 +1,275 @@
 #include <mc_control/mc_global_controller.h>
 
+#include <boost/program_options.hpp>
+namespace po = boost::program_options;
+
 #include <franka/exception.h>
 #include <franka/robot.h>
-#include <franka/model.h>
-#include <franka/vacuum_gripper.h>
+
+#include <chrono>
+#include <condition_variable>
 #include <iostream>
+#include <thread>
 
-// mc_panda
-#include <mc_panda/devices/Pump.h>
-#include <mc_panda/devices/PandaSensor.h>
-
-namespace {
-template <class T, size_t N>
-std::ostream& operator<<(std::ostream& ostream, const std::array<T, N>& array) {
-  ostream << "[";
-  std::copy(array.cbegin(), array.cend() - 1, std::ostream_iterator<T>(ostream, ","));
-  std::copy(array.cend() - 1, array.cend(), std::ostream_iterator<T>(ostream));
-  ostream << "]";
-  return ostream;
-}
-}  // anonymous namespace
-
-void usage(const char * prog)
+namespace mc_time
 {
-  std::cerr << "[usage] " << prog << " <fci-ip>\n";
+
+using duration_us = std::chrono::duration<double, std::micro>;
+/** Always pick a steady clock */
+using clock = typename std::conditional<std::chrono::high_resolution_clock::is_steady,
+                                        std::chrono::high_resolution_clock,
+                                        std::chrono::steady_clock>::type;
+
+} // namespace mc_time
+
+#include "PandaControlType.h"
+
+std::condition_variable sensors_cv;
+std::mutex sensors_mutex;
+std::condition_variable command_cv;
+std::mutex command_mutex;
+
+template<ControlMode cm>
+struct PandaControlLoop
+{
+  PandaControlLoop(const std::string & name, const std::string & ip, size_t steps)
+  : name(name), robot(ip), state(robot.readOnce()), control(state), steps(steps)
+  {
+  }
+
+  void updateSensors(mc_rbdyn::Robot & robot, mc_rbdyn::Robot & real)
+  {
+    using get_sensor_t = const std::vector<double> & (mc_rbdyn::Robot::*)() const;
+    using set_sensor_t = void (mc_rbdyn::Robot::*)(const std::vector<double> &);
+    auto updateSensor = [&](get_sensor_t get, set_sensor_t set, const std::array<double, 7> & value) {
+      auto sensor = (robot.*get)();
+      if(sensor.size() != robot.refJointOrder().size())
+      {
+        sensor.resize(robot.refJointOrder().size());
+      }
+      for(size_t i = 0; i < value.size(); ++i)
+      {
+        sensor[i] = value[i];
+      }
+      (robot.*set)(sensor);
+      (real.*set)(sensor);
+    };
+    updateSensor(&mc_rbdyn::Robot::encoderValues, &mc_rbdyn::Robot::encoderValues, state.q);
+    updateSensor(&mc_rbdyn::Robot::encoderVelocities, &mc_rbdyn::Robot::encoderVelocities, state.dq);
+    updateSensor(&mc_rbdyn::Robot::jointTorques, &mc_rbdyn::Robot::jointTorques, state.tau_J);
+    command = robot.mbc();
+  }
+
+  void updateSensors(mc_control::MCGlobalController & controller)
+  {
+    auto & robot = controller.controller().robots().robot(name);
+    auto & real = controller.controller().realRobots().robot(name);
+    updateSensors(robot, real);
+  }
+
+  void init(mc_control::MCGlobalController & controller)
+  {
+    auto & robot = controller.controller().robots().robot(name);
+    auto & real = controller.controller().realRobots().robot(name);
+    updateSensors(robot, real);
+    const auto & rjo = robot.refJointOrder();
+    for(size_t i = 0; i < rjo.size(); ++i)
+    {
+      auto jIndex = robot.jointIndexByName(rjo[i]);
+      robot.mbc().q[jIndex][0] = state.q[i];
+      robot.mbc().jointTorque[jIndex][0] = state.tau_J[i];
+    }
+    robot.forwardKinematics();
+    real.mbc() = robot.mbc();
+  }
+
+  void control_thread(mc_control::MCGlobalController & controller)
+  {
+    control.control(robot,
+                    [ this, &controller ](const franka::RobotState & stateIn, franka::Duration) ->
+                    typename PandaControlType<cm>::ReturnT {
+                      this->state = stateIn;
+                      sensor_id += 1;
+                      auto & robot = controller.controller().robots().robot(name);
+                      auto & real = controller.controller().realRobots().robot(name);
+                      if(sensor_id % steps == 0)
+                      {
+                        sensors_cv.notify_all();
+                        std::unique_lock<std::mutex> command_lock(command_mutex);
+                        command_cv.wait(command_lock);
+                      }
+                      if(controller.running)
+                      {
+                        return control.update(robot, command, sensor_id % steps, steps);
+                      }
+                      return franka::MotionFinished(control);
+                    });
+  }
+
+  std::string name;
+  franka::Robot robot;
+  franka::RobotState state;
+  PandaControlType<cm> control;
+  size_t sensor_id = 0;
+  size_t steps = 1;
+  rbd::MultiBodyConfig command;
+};
+
+template<ControlMode cm>
+void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig)
+{
+  auto frankaConfig = gconfig.config("Franka");
+  auto ignoredRobots = frankaConfig("ignored", std::vector<std::string>{});
+  mc_control::MCGlobalController controller(gconfig);
+  if(controller.controller().timeStep < 0.001)
+  {
+    mc_rtc::log::error_and_throw<std::runtime_error>("mc_rtc cannot run faster than 1kHz with mc_franka");
+  }
+  size_t n_steps = std::ceil(controller.controller().timeStep / 0.001);
+  size_t freq = std::ceil(1 / controller.controller().timeStep);
+  mc_rtc::log::info("mc_rtc running at {}Hz, will interpolate every {} panda control step", freq, n_steps);
+  auto & robots = controller.controller().robots();
+  // Initialize all real robots
+  for(size_t i = controller.realRobots().size(); i < robots.size(); ++i)
+  {
+    controller.realRobots().robotCopy(robots.robot(i));
+    controller.realRobots().robots().back().name(robots.robot(i).name());
+  }
+  // Initialize controlled panda robot
+  std::vector<std::pair<PandaControlLoop<cm>, size_t>> pandas;
+  for(auto & robot : robots)
+  {
+    if(robot.mb().nrDof() == 0)
+    {
+      continue;
+    }
+    if(std::find(ignoredRobots.begin(), ignoredRobots.end(), robot.name()) != ignoredRobots.end())
+    {
+      continue;
+    }
+    if(frankaConfig.has(robot.name()))
+    {
+      std::string ip = frankaConfig(robot.name())("ip");
+      pandas.emplace_back(std::make_pair<PandaControlLoop<cm>, size_t>({robot.name(), ip, n_steps}, 0));
+      pandas.back().first.init(controller);
+    }
+    else
+    {
+      mc_rtc::log::warning("The loaded controller uses an actuated robot that is not configured and not ignored: {}",
+                           robot.name());
+    }
+  }
+  for(auto & panda : pandas)
+  {
+    controller.controller().logger().addLogEntry(panda.first.name + "_sensors_id", [&panda]() { return panda.second; });
+  }
+  controller.init(robots.robot().encoderValues());
+  controller.running = true;
+  controller.controller().gui()->addElement(
+      {"Franka"}, mc_rtc::gui::Button("Stop controller", [&controller]() { controller.running = false; }));
+  // Start panda control loops
+  std::vector<std::thread> panda_threads;
+  for(auto & panda : pandas)
+  {
+    panda_threads.emplace_back([&panda, &controller]() { panda.first.control_thread(controller); });
+  }
+  size_t iter = 0;
+  while(controller.running)
+  {
+    {
+      std::unique_lock<std::mutex> sensors_lock(sensors_mutex);
+      bool start_measure = false;
+      std::chrono::time_point<mc_time::clock> start;
+      sensors_cv.wait(sensors_lock, [&]() {
+        if(!start_measure)
+        {
+          start_measure = true;
+          start = mc_time::clock::now();
+        }
+        for(const auto & panda : pandas)
+        {
+          if(panda.first.sensor_id % n_steps != 0 || panda.first.sensor_id == panda.second)
+          {
+            return false;
+          }
+        }
+        return true;
+      });
+      if(iter++ % 5 * freq == 0 && pandas.size() > 1)
+      {
+        mc_time::duration_us delay = mc_time::clock::now() - start;
+        mc_rtc::log::info("[mc_franka] Measured delay between the pandas: {}us", delay.count());
+      }
+      for(auto & panda : pandas)
+      {
+        panda.first.updateSensors(controller);
+        panda.second = panda.first.sensor_id;
+      }
+      command_cv.notify_all();
+    }
+    controller.run();
+  }
+  for(auto & th : panda_threads)
+  {
+    th.join();
+  }
 }
+
+template<ControlMode cm>
+struct GlobalControlLoop
+{
+  mc_control::MCGlobalController & controller;
+  std::vector<PandaControlLoop<cm>> robots;
+};
 
 int main(int argc, char * argv[])
 {
-  if(argc < 2)
+  std::string conf_file = "";
+  po::options_description desc("MCUDPControl options");
+  // clang-format off
+  desc.add_options()
+    ("help", "Display help message")
+    ("conf,f", po::value<std::string>(&conf_file), "Configuration file");
+  // clang-format on
+
+  po::variables_map vm;
+  po::store(po::parse_command_line(argc, argv, desc), vm);
+  po::notify(vm);
+
+  if(vm.count("help"))
   {
-    usage(argv[0]);
+    std::cout << desc << "\n";
+    std::cout << "see etc/sample.yaml for libfranka configuration\n";
     return 1;
   }
 
-  // Initialize data fields for the print thread.
-  struct {
-    std::mutex mutex;
-    bool has_data;
-    franka::RobotState robot_state;
-    sva::ForceVecd wrench;
-    bool is_singular;
-  } print_data{};
-  std::atomic_bool running{true};
-  const double print_rate = 2.0; //number of prints per second
-  // Start print thread.
-  std::thread print_thread([print_rate, &print_data, &running]() {
-    while (running) {
-      // Sleep to achieve the desired print rate.
-      std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>((1.0 / print_rate * 1000.0))));
-      // Try to lock data to avoid read write collisions.
-      if (print_data.mutex.try_lock()) {
-        if (print_data.has_data) {
-          std::cout << "end-effector force= " <<  print_data.wrench.force().transpose() << " and moment =" << print_data.wrench.moment().transpose() << " and is_singular: "<< print_data.is_singular << std::endl;
-          print_data.has_data = false;
-        }
-        print_data.mutex.unlock();
-      }
-    }
-  });
-
+  mc_control::MCGlobalController::GlobalConfiguration gconfig(conf_file, nullptr);
+  if(!gconfig.config.has("Franka"))
+  {
+    mc_rtc::log::error_and_throw<std::runtime_error>(
+        "No Franka section in the configuration, see etc/sample.yaml for an example");
+  }
+  auto frankaConfig = gconfig.config("Franka");
+  ControlMode cm = frankaConfig("ControlMode", ControlMode::Velocity);
   try
   {
-    // Initialize the robot
-    franka::Robot robot(argv[1]);
-    robot.setJointImpedance({{3000, 3000, 3000, 2500, 2500, 2000, 2000}}); //values taken from https://github.com/frankaemika/libfranka/blob/master/examples/examples_common.cpp#L18
-    robot.setCartesianImpedance({{3000, 3000, 3000, 300, 300, 300}}); //values taken from https://github.com/frankaemika/libfranka/blob/master/examples/examples_common.cpp#L19
-    // robot.setJointImpedance({{100,100,100,100,100,100,100}}); 
-    // robot.setCartesianImpedance({{100,100,100,10,10,10}});
-    robot.setCollisionBehavior( //values taken from https://github.com/frankaemika/libfranka/blob/master/examples/generate_joint_velocity_motion.cpp#L39
-        {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}}, {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
-        {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}}, {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
-        {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}}, {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}},
-        {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}}, {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}});
-    
-    
-    robot.setCollisionBehavior( //TODO: be careful with this mode!
-        {{200.0, 200.0, 180.0, 180.0, 160.0, 140.0, 120.0}}, {{200.0, 200.0, 180.0, 180.0, 160.0, 140.0, 120.0}},
-        {{200.0, 200.0, 180.0, 180.0, 160.0, 140.0, 120.0}}, {{200.0, 200.0, 180.0, 180.0, 160.0, 140.0, 120.0}},
-        {{200.0, 200.0, 200.0, 250.0, 250.0, 250.0}}, {{200.0, 200.0, 200.0, 250.0, 250.0, 250.0}},
-        {{200.0, 200.0, 200.0, 250.0, 250.0, 250.0}}, {{200.0, 200.0, 200.0, 250.0, 250.0, 250.0}});
-
-    // Get the initial state of the robot
-    const auto state = robot.readOnce();
-    const int dof = state.q.size();
-
-    // Initialize mc_rtc
-    mc_control::MCGlobalController controller;
-    if(controller.controller().timeStep != 0.001)
+    switch(cm)
     {
-      LOG_ERROR_AND_THROW(std::runtime_error, "mc_rtc must be configured to run at 1kHz");
+      case ControlMode::Position:
+        global_thread<ControlMode::Position>(gconfig);
+        break;
+      case ControlMode::Velocity:
+        global_thread<ControlMode::Velocity>(gconfig);
+        break;
+      case ControlMode::Torque:
+        global_thread<ControlMode::Torque>(gconfig);
+        break;
     }
-    sva::ForceVecd wrench = sva::ForceVecd(Eigen::Vector6d::Zero());
-    std::map<std::string, sva::ForceVecd> wrenches;
-    wrenches.insert(std::make_pair("LeftHandForceSensor", wrench));
-    std::vector<double> init_q_vector;
-    std::vector<double> q_vector;
-    std::vector<double> dq_vector;
-    std::vector<double> tau_vector;
-    std::vector<double> dtau_vector;
-    init_q_vector.resize(dof);
-    q_vector.resize(dof);
-    dq_vector.resize(dof);
-    tau_vector.resize(dof);
-    dtau_vector.resize(dof);
-    for(size_t i = 0; i < dof; ++i)
-    {
-      init_q_vector.at(i)=state.q[i];
-      q_vector.at(i)=state.q[i];
-      dq_vector.at(i)=state.dq[i];
-      tau_vector.at(i)=state.tau_J[i];
-      dtau_vector.at(i)=state.tau_J[i];
-    }
-    // FIXME Temporary work-around until we handle the gripper
-    int counter=dof-1;
-    while(controller.robot().refJointOrder().size() > init_q_vector.size())
-    {
-      counter++;
-      init_q_vector.at(counter)=0;
-    }
-    controller.setEncoderValues(q_vector);
-    controller.setEncoderVelocities(dq_vector);
-    controller.setJointTorques(tau_vector);
-    // controller.setJointTorques(dtau_vector); //TODO extend interface
-    controller.setWrenches(wrenches);
-    controller.init(init_q_vector);
-    controller.running = true;
-    controller.controller().gui()->addElement({"Franka"},
-                                              mc_rtc::gui::Button("Stop controller", [&controller]() { controller.running = false; }));
-
-    // Initialize the the mc_panda PandaSensor as 'sensor' if the robot-module has such a device
-    bool sensorAvailable = false;
-    std::shared_ptr<mc_panda::PandaSensor> sensor;
-    std::string sensorDeviceName = "PandaSensor";
-    if(controller.robot().hasDevice<mc_panda::PandaSensor>(sensorDeviceName))
-    {
-      sensor = std::make_shared<mc_panda::PandaSensor>( controller.robot().device<mc_panda::PandaSensor>(sensorDeviceName) );
-      sensor->addToLogger(controller.controller().logger());
-      sensorAvailable = true;
-      mc_rtc::log::info("RobotModule has a PandaSensor named {}", sensorDeviceName);
-    }
-    else{
-      mc_rtc::log::warning("RobotModule does not have a PandaSensor named {}", sensorDeviceName);
-      mc_rtc::log::warning("PandaSensor functionality will not be available");
-    }
-    sensorAvailable = false; //TODO THIS IS A HACK
-    
-    // Initialize the libfranka VacuumGripper as 'sucker' and the mc_panda Pump as 'pump' if the robot-module has such a device
-    bool pumpAvailable = false;
-    std::shared_ptr<franka::VacuumGripper> sucker;
-    std::shared_ptr<mc_panda::Pump> pump;
-    try{
-      sucker = std::make_shared<franka::VacuumGripper>( franka::VacuumGripper(argv[1]) );
-      mc_rtc::log::info("Connection established to VacuumGripper via {}", argv[1]);
-      
-      std::string pumpDeviceName = "Pump";
-      if(controller.robot().hasDevice<mc_panda::Pump>(pumpDeviceName))
-      {
-        pump = std::make_shared<mc_panda::Pump>( controller.robot().device<mc_panda::Pump>(pumpDeviceName) );
-        pump->addToLogger(controller.controller().logger());
-        pumpAvailable = true;
-        mc_rtc::log::info("RobotModule has a Pump named {}", pumpDeviceName);
-      }
-      else{
-        mc_rtc::log::warning("RobotModule does not have a Pump named {}", pumpDeviceName);
-        mc_rtc::log::warning("Pump functionality will not be available");
-      }
-    }
-    catch(const franka::NetworkException & e)
-    {
-      mc_rtc::log::warning("Cannot connect to VacuumGripper via {}", argv[1]);
-      mc_rtc::log::warning("Pump functionality will not be available");
-    }
-    pumpAvailable = false; //TODO THIS IS A HACK
-
-    // Start the control loop in velocity-control
-    bool is_singular = false;;
-    franka::Model model = robot.loadModel();
-    franka::JointVelocities output_dq(state.dq);
-    robot.control([&print_data,&model,&controller,&sucker,&pump,&pumpAvailable,&sensor,&sensorAvailable,&q_vector,&dq_vector,&tau_vector,&dtau_vector,&wrench,&wrenches,&is_singular,&output_dq](const franka::RobotState & state, franka::Duration) -> franka::JointVelocities
-    {
-      for(size_t i = 0; i < state.q.size(); ++i)
-      {
-        q_vector[i] = state.q[i];
-        dq_vector[i] = state.dq[i];
-        tau_vector[i] = state.tau_J[i];
-        dtau_vector[i] = state.dtau_J[i];
-      }
-
-      wrench.force().x() = state.K_F_ext_hat_K[0];
-      wrench.force().y() = state.K_F_ext_hat_K[1];
-      wrench.force().z() = state.K_F_ext_hat_K[2];
-      wrench.moment().x() = state.K_F_ext_hat_K[3];
-      wrench.moment().y() = state.K_F_ext_hat_K[4];
-      wrench.moment().z() = state.K_F_ext_hat_K[5];
-      
-      is_singular = false;
-      if(wrench.force().x()==0 && wrench.force().y()==0 && wrench.force().z()==0 && wrench.moment().x()==0 && wrench.moment().y()==0 && wrench.moment().z()==0 ){
-        // LOG_ERROR("libfranka wrench is zero") //NOTE this happens if smallest singular value of the jacobian is lower than 0.08...
-        is_singular = true;
-        const std::array<double, 42> jacobian_array = model.zeroJacobian(franka::Frame::kEndEffector, state);
-        const Eigen::Matrix<double, 6, 7> jacobian(jacobian_array.data());
-        const Eigen::Matrix<double, 7, 1> torques(state.tau_ext_hat_filtered.data());
-
-        Eigen::JacobiSVD<Eigen::Matrix<double, 7, 6>> svdT = Eigen::JacobiSVD<Eigen::Matrix<double, 7, 6>>();
-        svdT.compute(jacobian.transpose(), Eigen::ComputeThinU | Eigen::ComputeThinV);
-        // const Eigen::VectorXd wrench_vector = svdT.solve(torques); //this solution maybe faster, but does not correspond to the libfranka wrenches for full-rank Jacobian
-        const Eigen::MatrixXd U = svdT.matrixU();
-        const Eigen::MatrixXd V = svdT.matrixV();
-        const Eigen::VectorXd Svec  = svdT.singularValues();
-        Eigen::Matrix<double, 6, 6> Sinv = Eigen::Matrix<double, 6, 6>::Zero();
-        for(int i=0; i<6; i++){
-          if (Svec(i)>=0.08) //important threshold, identical to the libfranka threshold!
-          {
-            Sinv(i,i) = 1.0 / Svec(i);
-          }
-        }
-        const Eigen::VectorXd wrench_vector = V * Sinv * U.transpose() * torques;
-
-        wrench.force() = wrench_vector.head<3>();
-        wrench.moment() = wrench_vector.tail<3>();
-        // LOG_SUCCESS("special force = [" << wrench.force().x() << ", " << wrench.force().y() << ", " << wrench.force().z() << "] and moment =[" << wrench.moment().x() << ", " << wrench.moment().y() << ", " << wrench.moment().z() << "]")
-      }
-
-      wrenches.find("LeftHandForceSensor")->second = wrench;
-
-      // int randomNumber = rand() % 500 + 1; //generate number between 1 and 1000
-      // if (randomNumber==500){
-      //   LOG_INFO("force = [" << wrench.force().x() << ", " << wrench.force().y() << ", " << wrench.force().z() << "] and moment =[" << wrench.moment().x() << ", " << wrench.moment().y() << ", " << wrench.moment().z() << "]")
-      // }
-
-      if(wrench.force().norm() > 30 && is_singular==false){
-        LOG_ERROR("stopping because wrench.force().norm() = " << wrench.force().norm())
-        LOG_ERROR("force = [" << wrench.force().x() << ", " << wrench.force().y() << ", " << wrench.force().z() << "] and moment =[" << wrench.moment().x() << ", " << wrench.moment().y() << ", " << wrench.moment().z() << "]")
-        return franka::MotionFinished(output_dq);
-      }
-      
-      controller.setEncoderValues(q_vector);
-      controller.setEncoderVelocities(dq_vector);
-      controller.setJointTorques(tau_vector);
-      // controller.setJointDTorques(ddtau_vector); //TODO extend interface
-      controller.setWrenches(wrenches);
-      if(sensorAvailable)
-      {
-        sensor->set_tau_ext_hat_filtered(state.tau_ext_hat_filtered);
-        sensor->set_O_F_ext_hat_K(state.O_F_ext_hat_K);
-        sensor->set_control_command_success_rate(state.control_command_success_rate);
-        sensor->set_m_ee(state.m_ee);
-        sensor->set_m_load(state.m_load);
-        sensor->set_joint_contact(state.joint_contact);
-        sensor->set_cartesian_contact(state.cartesian_contact);
-      }
-      if(pumpAvailable)
-      {
-        const franka::VacuumGripperState stateSucker = sucker->readOnce();
-        pump->set_in_control_range(stateSucker.in_control_range);
-        pump->set_part_detached(stateSucker.part_detached);
-        pump->set_part_present(stateSucker.part_present);
-        if(stateSucker.device_status==franka::VacuumGripperDeviceStatus::kGreen){
-          pump->set_device_status_ok(true);
-        }
-        else{
-          pump->set_device_status_ok(false);
-        }
-        pump->set_actual_power(stateSucker.actual_power);
-        pump->set_vacuum(stateSucker.vacuum);
-      }
-
-      if(controller.running && controller.run())
-      {
-        if(pumpAvailable)
-        {
-          if(pump->vacuumCommandRequested())
-          {
-            uint8_t vacuum;
-            std::chrono::milliseconds timeout;
-            pump->getVacuumCommandParams(vacuum, timeout);
-            bool vacuumOK = sucker->vacuum(vacuum, timeout);
-            pump->setVacuumCommandResult(vacuumOK);
-            mc_rtc::log::info("vacuum command applied with the params vacuum {} and timeout {}, result: {}", std::to_string(vacuum), std::to_string(timeout.count()), vacuumOK);
-          }
-          if(pump->dropoffCommandRequested())
-          {
-            std::chrono::milliseconds timeout;
-            pump->getDropoffCommandParam(timeout);
-            bool dropoffOK = sucker->dropOff(timeout);
-            pump->setDropoffCommandResult(dropoffOK);
-            mc_rtc::log::info("dropoff command applied with the param timeout {}, result: {}", std::to_string(timeout.count()), dropoffOK);
-          }
-          if(pump->stopCommandRequested())
-          {
-            bool stopOK = sucker->stop();
-            pump->setStopCommandResult(stopOK);
-            mc_rtc::log::info("stop command applied, result: {}", stopOK);
-          }
-        }
-
-        const auto & rjo = controller.robot().refJointOrder();
-        for(size_t i = 0; i < output_dq.dq.size(); ++i)
-        {
-          const auto & j = rjo[i];
-          output_dq.dq[i] = controller.robot().mbc().alpha[controller.robot().jointIndexByName(j)][0];
-        }
-
-        // Update data to print.
-        if (print_data.mutex.try_lock()) {
-          print_data.has_data = true;
-          print_data.robot_state = state;
-          print_data.wrench = wrench;
-          print_data.is_singular = is_singular;
-          print_data.mutex.unlock();
-        }
-        return output_dq;
-      }
-      output_dq.dq = state.dq;
-      return franka::MotionFinished(output_dq);
-    // }, franka::ControllerMode::kJointImpedance, true, 100); //default parameters
-    }, franka::ControllerMode::kJointImpedance, true, 1000); //increased kDefaultCutoffFrequency 
-
-    robot.stop();
   }
   catch(const franka::Exception & e)
   {
-    running = false;
     std::cerr << "franka::Exception " << e.what() << "\n";
-    // return 1;
-  }
-
-  if (print_thread.joinable()) {
-    print_thread.join();
+    return 1;
   }
   return 0;
 }
