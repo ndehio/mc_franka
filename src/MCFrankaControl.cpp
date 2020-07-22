@@ -31,8 +31,13 @@ using clock = typename std::conditional<std::chrono::high_resolution_clock::is_s
 
 std::condition_variable sensors_cv;
 std::mutex sensors_mutex;
+std::atomic<size_t> sensors_ready(0);
 std::condition_variable command_cv;
 std::mutex command_mutex;
+std::atomic<size_t> command_ready(0);
+std::condition_variable start_control_cv;
+std::mutex start_control_mutex;
+bool start_control_ready = false;
 
 template<ControlMode cm>
 struct PandaControlLoop
@@ -41,6 +46,11 @@ struct PandaControlLoop
   PandaControlLoop(const std::string & name, const std::string & ip, size_t steps)
   : name(name), robotFE(ip), stateRobotFE(robotFE.readOnce()), controlPandaFE(stateRobotFE), steps(steps)
   {
+    static auto panda_init_t = mc_time::clock::now();
+    auto now = mc_time::clock::now();
+    mc_time::duration_us dt = now - panda_init_t;
+    mc_rtc::log::info("[mc_franka] Elapsed time since the creation of another PandaControlLoop: {}us", dt.count());
+    panda_init_t = now;
   }
 
   void updateSensors(mc_rbdyn::Robot & robotMC, mc_rbdyn::Robot & realMC)
@@ -118,9 +128,20 @@ struct PandaControlLoop
 
   void control_thread(mc_control::MCGlobalController & controllerMC)
   {
+    {
+      std::unique_lock<std::mutex> start_control_lock(start_control_mutex);
+      start_control_cv.wait(start_control_lock, [](){ return start_control_ready; });
+    }
     controlPandaFE.control(robotFE,
                     [ this, &controllerMC ](const franka::RobotState & stateRobotIn, franka::Duration) ->
                     typename PandaControlType<cm>::ReturnT {
+                      if(!started)
+                      {
+                        timespec tv;
+                        clock_gettime(CLOCK_REALTIME, &tv);
+                        mc_rtc::log::info("[mc_franka] {} control loop started at {}", name, tv.tv_sec + tv.tv_nsec * 1e-9);
+                        started = true;
+                      }
                       const std::string pandasensorDeviceName = "PandaSensor";
                       if(controllerMC.controller().robots().robot(name).hasDevice<mc_panda::PandaSensor>(pandasensorDeviceName))
                       {
@@ -137,9 +158,11 @@ struct PandaControlLoop
                       //auto & realMC = controllerMC.controller().realRobots().robot(name); //TODO not required?
                       if(sensor_id % steps == 0)
                       {
-                        sensors_cv.notify_all();
+                        sensors_ready++;
+                        sensors_cv.notify_one();
                         std::unique_lock<std::mutex> command_lock(command_mutex);
-                        command_cv.wait(command_lock);
+                        command_cv.wait(command_lock, []() { return command_ready > 0; });
+                        command_ready--;
                       }
                       if(controllerMC.running)
                       {
@@ -156,6 +179,7 @@ struct PandaControlLoop
   size_t sensor_id = 0;
   size_t steps = 1;
   rbd::MultiBodyConfig commandMC;
+  bool started = false;
 };
 
 struct PumpControlLoop
@@ -164,6 +188,11 @@ struct PumpControlLoop
   PumpControlLoop(const std::string & name, const std::string & ip, size_t steps)
   : name(name), suckerFE(ip), stateSuckerFE(suckerFE.readOnce()), steps(steps)
   {
+    static auto panda_init_t = mc_time::clock::now();
+    auto now = mc_time::clock::now();
+    mc_time::duration_us dt = now - panda_init_t;
+    mc_rtc::log::info("[mc_franka] Elapsed time since the creation of another PandaControlLoop: {}us", dt.count());
+    panda_init_t = now;
   }
 
   void updateSensors(mc_control::MCGlobalController & controllerMC) //TODO check
@@ -193,6 +222,17 @@ struct PumpControlLoop
 
   void control_thread(mc_control::MCGlobalController & controllerMC) //TODO check
   {
+    {
+      std::unique_lock<std::mutex> start_control_lock(start_control_mutex);
+      start_control_cv.wait(start_control_lock, [](){ return start_control_ready; });
+    }
+    if(!started)
+    {
+      timespec tv;
+      clock_gettime(CLOCK_REALTIME, &tv);
+      mc_rtc::log::info("[mc_franka] {} control loop started at {}", name, tv.tv_sec + tv.tv_nsec * 1e-9);
+      started = true;
+    }
     this->stateSuckerFE = suckerFE.readOnce();
     sensor_id += 1;
     if(sensor_id % steps == 0)
@@ -249,6 +289,14 @@ struct PumpControlLoop
           mc_rtc::log::error_and_throw<std::runtime_error>("PUMP-CONTROL: next command has unexpected value");
         }
       }
+      if(sensor_id % steps == 0)
+      {
+        sensors_ready++;
+        sensors_cv.notify_one();
+        std::unique_lock<std::mutex> command_lock(command_mutex);
+        command_cv.wait(command_lock, []() { return command_ready > 0; });
+        command_ready--;
+      }
     }
   }
 
@@ -257,6 +305,7 @@ struct PumpControlLoop
   franka::VacuumGripperState stateSuckerFE;
   size_t sensor_id = 0;
   size_t steps = 1;
+  bool started = false;
 };
 
 template<ControlMode cm>
@@ -283,48 +332,65 @@ void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig
   // Initialize controlled panda robot and pump device
   std::vector<std::pair<PandaControlLoop<cm>, size_t>> pandas;
   std::vector<std::pair<PumpControlLoop, size_t>> pumps;
-  for(auto & robotMC : robotsMC)
   {
-    if(robotMC.mb().nrDof() == 0)
+    std::vector<std::thread> panda_init_threads;
+    std::mutex pandas_init_mutex;
+    std::condition_variable pandas_init_cv;
+    bool pandas_init_ready = false;
+    for(auto & robotMC : robotsMC)
     {
-      continue;
-    }
-    if(std::find(ignoredRobots.begin(), ignoredRobots.end(), robotMC.name()) != ignoredRobots.end())
-    {
-      continue;
-    }
-    if(frankaConfig.has(robotMC.name()))
-    {
-      std::string ip = frankaConfig(robotMC.name())("ip");
-      pandas.emplace_back(std::make_pair<PandaControlLoop<cm>, size_t>({robotMC.name(), ip, n_steps}, 0));
-      pandas.back().first.init(controllerMC);
-      pumps.emplace_back(std::make_pair<PumpControlLoop, size_t>({robotMC.name(), ip, n_steps}, 0)); //TODO which name?
-      pumps.back().first.init(controllerMC);
-
-      //start to log data for all devices //TODO check 
-      const std::string pandasensorDeviceName = "PandaSensor";
-      if(controllerMC.controller().robots().robot(robotMC.name()).hasDevice<mc_panda::PandaSensor>(pandasensorDeviceName))
+      if(robotMC.mb().nrDof() == 0)
       {
-        controllerMC.controller().robots().robot(robotMC.name()).device<mc_panda::PandaSensor>(pandasensorDeviceName).addToLogger(controllerMC.controller().logger());
+        continue;
       }
-      const std::string pumpDeviceName = "Pump";
-      if(controllerMC.controller().robots().robot(robotMC.name()).hasDevice<mc_panda::Pump>(pumpDeviceName))
+      if(std::find(ignoredRobots.begin(), ignoredRobots.end(), robotMC.name()) != ignoredRobots.end())
       {
-        controllerMC.controller().robots().robot(robotMC.name()).device<mc_panda::Pump>(pumpDeviceName).addToLogger(controllerMC.controller().logger());
+        continue;
+      }
+      if(frankaConfig.has(robotMC.name()))
+      {
+        std::string ip = frankaConfig(robotMC.name())("ip");
+        panda_init_threads.emplace_back([&,ip]() {
+          {
+            std::unique_lock<std::mutex> lock(pandas_init_mutex);
+            pandas_init_cv.wait(lock, [&pandas_init_ready]() { return pandas_init_ready; });
+          }
+          auto pair = std::make_pair<PandaControlLoop<cm>, size_t>({robotMC.name(), ip, n_steps}, 0);
+          std::unique_lock<std::mutex> lock(pandas_init_mutex);
+          pandas.emplace_back(std::move(pair));
+        });
+        //start to log data for all devices //TODO check 
+        const std::string pandasensorDeviceName = "PandaSensor";
+        if(controllerMC.controller().robots().robot(robotMC.name()).hasDevice<mc_panda::PandaSensor>(pandasensorDeviceName))
+        {
+          controllerMC.controller().robots().robot(robotMC.name()).device<mc_panda::PandaSensor>(pandasensorDeviceName).addToLogger(controllerMC.controller().logger());
+        }
+        const std::string pumpDeviceName = "Pump";
+        if(controllerMC.controller().robots().robot(robotMC.name()).hasDevice<mc_panda::Pump>(pumpDeviceName))
+        {
+          controllerMC.controller().robots().robot(robotMC.name()).device<mc_panda::Pump>(pumpDeviceName).addToLogger(controllerMC.controller().logger());
+        }
+      }
+      else
+      {
+        mc_rtc::log::warning("The loaded controller uses an actuated robot that is not configured and not ignored: {}",
+                             robotMC.name());
       }
     }
-    else
+    pandas_init_ready = true;
+    for(auto & th : panda_init_threads)
     {
-      mc_rtc::log::warning("The loaded controllerMC uses an actuated robot that is not configured and not ignored: {}",
-                           robotMC.name());
+      th.join();
     }
   }
   for(auto & panda : pandas)
   {
+    panda.first.init(controllerMC);
     controllerMC.controller().logger().addLogEntry(panda.first.name + "_sensors_id", [&panda]() { return panda.second; });
   }
   for(auto & pump : pumps)
   {
+    pump.first.init(controllerMC);
     controllerMC.controller().logger().addLogEntry(pump.first.name + "_pumpsensors_id", [&pump]() { return pump.second; });
   }
   controllerMC.init(robotsMC.robot().encoderValues());
@@ -343,6 +409,8 @@ void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig
   {
     pump_threads.emplace_back([&pump, &controllerMC]() { pump.first.control_thread(controllerMC); });
   }
+  start_control_ready = true;
+  start_control_cv.notify_all();
   size_t iter = 0;
   while(controllerMC.running)
   {
@@ -351,27 +419,15 @@ void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig
       bool start_measure = false;
       std::chrono::time_point<mc_time::clock> start;
       sensors_cv.wait(sensors_lock, [&]() {
-        if(!start_measure)
+        auto ready = sensors_ready.load();
+        if(!start_measure && ready >= 1)
         {
           start_measure = true;
           start = mc_time::clock::now();
         }
-        for(const auto & panda : pandas)
-        {
-          if(panda.first.sensor_id % n_steps != 0 || panda.first.sensor_id == panda.second)
-          {
-            return false;
-          }
-        }
-        for(const auto & pump : pumps) //TODO
-        {
-          if(pump.first.sensor_id % n_steps != 0 || pump.first.sensor_id == pump.second)
-          {
-            return false;
-          }
-        }
-        return true;
+        return sensors_ready == pandas.size(); //TODO + pumps.size()
       });
+      sensors_ready = 0;
       if(iter++ % 5 * freq == 0 && pandas.size() > 1)
       {
         mc_time::duration_us delay = mc_time::clock::now() - start;
@@ -387,6 +443,7 @@ void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig
         pump.first.updateSensors(controllerMC);
         pump.second = pump.first.sensor_id;
       }
+      command_ready = pandas.size(); //TODO + pumps.size()
       command_cv.notify_all();
     }
     controllerMC.run();
