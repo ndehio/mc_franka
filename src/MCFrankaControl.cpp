@@ -86,15 +86,15 @@ struct PandaControlLoop
 
     // update pandasensor-device //TODO check
     const std::string pandasensorDeviceName = "PandaSensor";
-    if(controllerMC.robots().robot(name).hasDevice<mc_panda::PandaSensor>(pandasensorDeviceName))
+    if(controllerMC.controller().robots().robot(name).hasDevice<mc_panda::PandaSensor>(pandasensorDeviceName))
     {
-      controllerMC.robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_tau_ext_hat_filtered(stateRobotFE.tau_ext_hat_filtered);
-      controllerMC.robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_O_F_ext_hat_K(stateRobotFE.O_F_ext_hat_K);
-      controllerMC.robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_control_command_success_rate(stateRobotFE.control_command_success_rate);
-      controllerMC.robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_m_ee(stateRobotFE.m_ee);
-      controllerMC.robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_m_load(stateRobotFE.m_load);
-      controllerMC.robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_joint_contact(stateRobotFE.joint_contact);
-      controllerMC.robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_cartesian_contact(stateRobotFE.cartesian_contact);
+      controllerMC.controller().robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_tau_ext_hat_filtered(stateRobotFE.tau_ext_hat_filtered);
+      controllerMC.controller().robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_O_F_ext_hat_K(stateRobotFE.O_F_ext_hat_K);
+      controllerMC.controller().robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_control_command_success_rate(stateRobotFE.control_command_success_rate);
+      controllerMC.controller().robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_m_ee(stateRobotFE.m_ee);
+      controllerMC.controller().robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_m_load(stateRobotFE.m_load);
+      controllerMC.controller().robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_joint_contact(stateRobotFE.joint_contact);
+      controllerMC.controller().robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).set_cartesian_contact(stateRobotFE.cartesian_contact);
     }
 
     updateSensors(robotMC, realMC);
@@ -121,6 +121,16 @@ struct PandaControlLoop
     controlPandaFE.control(robotFE,
                     [ this, &controllerMC ](const franka::RobotState & stateRobotIn, franka::Duration) ->
                     typename PandaControlType<cm>::ReturnT {
+                      const std::string pandasensorDeviceName = "PandaSensor";
+                      if(controllerMC.controller().robots().robot(name).hasDevice<mc_panda::PandaSensor>(pandasensorDeviceName))
+                      {
+                        if(controllerMC.controller().robots().robot(name).device<mc_panda::PandaSensor>(pandasensorDeviceName).stopRequested())
+                        {
+                          //TODO at this point also stop the real pump!
+                          return franka::MotionFinished(controlPandaFE);
+                        }
+                      }
+
                       this->stateRobotFE = stateRobotIn;
                       sensor_id += 1;
                       auto & robotMC = controllerMC.controller().robots().robot(name);
@@ -160,19 +170,19 @@ struct PumpControlLoop
   {
     // update pump-device
     const std::string pumpDeviceName = "Pump";
-    if(controllerMC.robots().robot(name).hasDevice<mc_panda::Pump>(pumpDeviceName))
+    if(controllerMC.controller().robots().robot(name).hasDevice<mc_panda::Pump>(pumpDeviceName))
     {
-      controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_in_control_range(stateSuckerFE.in_control_range);
-      controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_part_detached(stateSuckerFE.part_detached);
-      controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_part_present(stateSuckerFE.part_present);
+      controllerMC.controller().robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_in_control_range(stateSuckerFE.in_control_range);
+      controllerMC.controller().robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_part_detached(stateSuckerFE.part_detached);
+      controllerMC.controller().robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_part_present(stateSuckerFE.part_present);
       if(stateSuckerFE.device_status==franka::VacuumGripperDeviceStatus::kGreen){
-        controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_device_status_ok(true);
+        controllerMC.controller().robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_device_status_ok(true);
       }
       else{
-        controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_device_status_ok(false);
+        controllerMC.controller().robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_device_status_ok(false);
       }
-      controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_actual_power(stateSuckerFE.actual_power);
-      controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_vacuum(stateSuckerFE.vacuum);
+      controllerMC.controller().robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_actual_power(stateSuckerFE.actual_power);
+      controllerMC.controller().robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).set_vacuum(stateSuckerFE.vacuum);
     }
   }
 
@@ -193,30 +203,51 @@ struct PumpControlLoop
     }
 
     const std::string pumpDeviceName = "Pump";
-    if(controllerMC.robots().robot(name).hasDevice<mc_panda::Pump>(pumpDeviceName))
+    if(controllerMC.controller().robots().robot(name).hasDevice<mc_panda::Pump>(pumpDeviceName))
     {
-      if(controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).vacuumCommandRequested())
+      auto & pumpDevice = controllerMC.controller().robots().robot(name).device<mc_panda::Pump>(pumpDeviceName);
+      mc_panda::NextPumpCommand nc;
+      nc = pumpDevice.NextPumpCommandRequested();
+      switch(nc)
       {
-        uint8_t vacuum;
-        std::chrono::milliseconds timeout;
-        controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).getVacuumCommandParams(vacuum, timeout);
-        bool vacuumOK = suckerFE.vacuum(vacuum, timeout);
-        controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).setVacuumCommandResult(vacuumOK);
-        mc_rtc::log::info("PUMP-CONTROL: vacuum command applied with the params vacuum {} and timeout {}, result: {}", std::to_string(vacuum), std::to_string(timeout.count()), vacuumOK);
-      }
-      if(controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).dropoffCommandRequested())
-      {
-        std::chrono::milliseconds timeout;
-        controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).getDropoffCommandParam(timeout);
-        bool dropoffOK = suckerFE.dropOff(timeout);
-        controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).setDropoffCommandResult(dropoffOK);
-        mc_rtc::log::info("PUMP-CONTROL: dropoff command applied with the param timeout {}, result: {}", std::to_string(timeout.count()), dropoffOK);
-      }
-      if(controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).stopCommandRequested())
-      {
-        bool stopOK = suckerFE.stop();
-        controllerMC.robots().robot(name).device<mc_panda::Pump>(pumpDeviceName).setStopCommandResult(stopOK);
-        mc_rtc::log::info("PUMP-CONTROL: stop command applied, result: {}", stopOK);
+        case mc_panda::NextPumpCommand::None:
+        {
+          mc_rtc::log::info("no command requested");
+          break;
+        }
+        case mc_panda::NextPumpCommand::Vacuum:
+        {
+          mc_rtc::log::info("vacuum command requested");
+          uint8_t vacuum;
+          std::chrono::milliseconds timeout;
+          pumpDevice.getVacuumCommandParams(vacuum, timeout);
+          const bool vacuumOK = suckerFE.vacuum(vacuum, timeout);
+          pumpDevice.setVacuumCommandResult(vacuumOK);
+          mc_rtc::log::info("PUMP-CONTROL: vacuum command applied with the params vacuum {} and timeout {}, result: {}", std::to_string(vacuum), std::to_string(timeout.count()), vacuumOK);
+          break;
+        }
+        case mc_panda::NextPumpCommand::Dropoff:
+        {
+          mc_rtc::log::info("dropoff command requested");
+          std::chrono::milliseconds timeout;
+          pumpDevice.getDropoffCommandParam(timeout);
+          const bool dropoffOK = suckerFE.dropOff(timeout);
+          pumpDevice.setDropoffCommandResult(dropoffOK);
+          mc_rtc::log::info("PUMP-CONTROL: dropoff command applied with the param timeout {}, result: {}", std::to_string(timeout.count()), dropoffOK);
+          break;
+        }
+        case mc_panda::NextPumpCommand::Stop:
+        {
+          mc_rtc::log::info("stop command requested");
+          const bool stopOK = suckerFE.stop();
+          pumpDevice.setStopCommandResult(stopOK);
+          mc_rtc::log::info("PUMP-CONTROL: stop command applied, result: {}", stopOK);
+          break;
+        }
+        default:
+        {
+          mc_rtc::log::error_and_throw<std::runtime_error>("PUMP-CONTROL: next command has unexpected value");
+        }
       }
     }
   }
@@ -272,14 +303,14 @@ void global_thread(mc_control::MCGlobalController::GlobalConfiguration & gconfig
 
       //start to log data for all devices //TODO check 
       const std::string pandasensorDeviceName = "PandaSensor";
-      if(controllerMC.robots().robot(robotMC.name()).hasDevice<mc_panda::PandaSensor>(pandasensorDeviceName))
+      if(controllerMC.controller().robots().robot(robotMC.name()).hasDevice<mc_panda::PandaSensor>(pandasensorDeviceName))
       {
-        controllerMC.robots().robot(robotMC.name()).device<mc_panda::PandaSensor>(pandasensorDeviceName).addToLogger(controllerMC.controller().logger());
+        controllerMC.controller().robots().robot(robotMC.name()).device<mc_panda::PandaSensor>(pandasensorDeviceName).addToLogger(controllerMC.controller().logger());
       }
       const std::string pumpDeviceName = "Pump";
-      if(controllerMC.robots().robot(robotMC.name()).hasDevice<mc_panda::Pump>(pumpDeviceName))
+      if(controllerMC.controller().robots().robot(robotMC.name()).hasDevice<mc_panda::Pump>(pumpDeviceName))
       {
-        controllerMC.robots().robot(robotMC.name()).device<mc_panda::Pump>(pumpDeviceName).addToLogger(controllerMC.controller().logger());
+        controllerMC.controller().robots().robot(robotMC.name()).device<mc_panda::Pump>(pumpDeviceName).addToLogger(controllerMC.controller().logger());
       }
     }
     else
