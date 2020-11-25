@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
       // Compute torque command
       std::array<double, 7> tau_d_calculated;
       for (size_t i = 0; i < 7; i++) {
-        tau_d_calculated[i] = coriolis[i];
+        tau_d_calculated[i] = 0.0; //coriolis[i];
       }
 
       // The following line is only necessary for printing the rate limited torque. As we activated
